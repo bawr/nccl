@@ -29,6 +29,19 @@
 static char ncclIbIfName[MAX_IF_NAME_SIZE+1];
 static union ncclSocketAddress ncclIbIfAddr;
 
+const long long second_to_nanoseconds = 1000000000;
+
+long long get_nanoseconds()
+{
+  long long ns = 0;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  ns += ts.tv_sec;
+  ns *= second_to_nanoseconds;
+  ns += ts.tv_nsec;
+  return ns;
+}
+
 struct ncclIbMr {
   uintptr_t addr;
   size_t pages;
@@ -499,6 +512,8 @@ struct ncclIbRequest {
   int events[NCCL_IB_MAX_DEVS_PER_NIC];
   struct ncclIbNetCommDevBase* devBases[NCCL_IB_MAX_DEVS_PER_NIC];
   int nreqs;
+  long long time;
+  int time_out;
   union {
     struct {
       int size;
@@ -1163,6 +1178,8 @@ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbReque
       r->devBases[0] = NULL;
       r->devBases[1] = NULL;
       r->events[0] = r->events[1] = 0;
+      r->time = get_nanoseconds();
+      r->time_out = 0;
       *req = r;
       return ncclSuccess;
     }
@@ -1174,6 +1191,8 @@ ncclResult_t ncclIbGetRequest(struct ncclIbNetCommBase* base, struct ncclIbReque
 
 ncclResult_t ncclIbFreeRequest(struct ncclIbRequest* r) {
   r->type = NCCL_NET_IB_REQ_UNUSED;
+  r->time = 0;
+  r->time_out = 0;
   return ncclSuccess;
 }
 
@@ -1651,6 +1670,7 @@ ncclResult_t ncclIbIflush(void* recvComm, int n, void** data, int* sizes, void**
 }
 
 ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
+  ncclResult_t ret = ncclSuccess;
   struct ncclIbRequest *r = (struct ncclIbRequest*)request;
   *done = 0;
   while (1) {
@@ -1696,7 +1716,8 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
             WARN("NET/IB : Got completion from peer %s with status=%d opcode=%d len=%d vendor err %d (%s)%s%s%s%s",
                 ncclSocketToString(&addr, line), wc->status, wc->opcode, wc->byte_len, wc->vendor_err, reqTypeStr[r->type],
                 localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGids":"", remoteGidString);
-            return ncclRemoteError;
+            ret = ncclRemoteError;
+            goto ret;
           }
 
           union ncclSocketAddress addr;
@@ -1713,7 +1734,8 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
               struct ncclIbRequest* sendReq = r->base->reqs+((wc->wr_id >> (j*8)) & 0xff);
               if ((sendReq->events[i] <= 0)) {
                 WARN("NET/IB: sendReq(%p)->events={%d,%d}, i=%d, j=%d <= 0", sendReq, sendReq->events[0], sendReq->events[1], i, j);
-                return ncclInternalError;
+                ret = ncclInternalError;
+                goto ret;
               }
               sendReq->events[i]--;
             }
@@ -1721,7 +1743,8 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
             if (req && wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
               if (req->type != NCCL_NET_IB_REQ_RECV) {
                 WARN("NET/IB: wc->opcode == IBV_WC_RECV_RDMA_WITH_IMM and req->type=%d", req->type);
-                return ncclInternalError;
+                ret = ncclInternalError;
+                goto ret;
               }
               if (req->nreqs == 1) {
                 req->recv.sizes[0] += wc->imm_data;
@@ -1734,8 +1757,27 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
     }
 
     // If no CQEs found on any device, return and come back later
-    if (totalWrDone == 0) return ncclSuccess;
+    if (totalWrDone == 0) {
+      ret = ncclSuccess;
+      goto ret;
+    }
   }
+
+  ret:
+
+  long long elapsed = get_nanoseconds() - r->time;
+  if (elapsed > 5 * second_to_nanoseconds) {
+    if (r->time_out == 0) {
+      r->time_out = 1;
+      union ncclSocketAddress dbg_addr;
+      ncclSocketGetAddr(r->sock, &dbg_addr);
+      char dbg_line[SOCKET_NAME_MAXLEN+1];
+      const char * dbg_name = ncclSocketToString(&dbg_addr, dbg_line);
+      printf("NCCL stall: %lld %d %d %d %p %s\n", elapsed, *done, ret, r->type, r, dbg_name);
+    }
+  }
+
+  return ret;
 }
 
 ncclResult_t ncclIbCloseSend(void* sendComm) {
