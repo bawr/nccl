@@ -1986,7 +1986,20 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
       ncclSocketGetAddr(r->sock, &dbg_addr);
       char dbg_line[SOCKET_NAME_MAXLEN+1];
       const char * dbg_name = ncclSocketToString(&dbg_addr, dbg_line);
-      printf("NCCL stall: %lld %d %d %d %p %s\n", elapsed, *done, ret, r->type, r, dbg_name);
+      int size = 0;
+      const char * barrier_info = "unknown!";
+      if (r->type == NCCL_NET_IB_REQ_RECV) {
+        for (int i=0; i<r->nreqs; i++) size += r->recv.sizes[i];
+        barrier_info = "op_recv@";
+      }
+      if (r->type == NCCL_NET_IB_REQ_SEND) {
+        size += r->send.size;
+        barrier_info = "op_send@";
+      }
+      if (size == 16) {
+        barrier_info = "barrier?";
+      }
+      printf("NCCL stall: %lld %d %d %d %p %d %s %s\n", elapsed, *done, ret, r->type, r, size, barrier_info, dbg_name);
     }
   }
 
